@@ -25,7 +25,7 @@ def run_ablation_studies():
     print(all_source_combos)
     # --- Build and Run Commands ---
     base_cmd = [
-        'python', 'src/spun_train_patch_pl10.py',
+        'python', 'src/spun_train_patch.py',
         '--num_runs', '50',
     ]
     

@@ -22,7 +22,6 @@ import sys
 # --- Model Imports ---
 import xgboost as xgb
 import lightgbm as lgb
-from ngboost import NGBRegressor
 
 import time
 import pickle
@@ -560,11 +559,6 @@ class CombinedPatchClimateEvaluator:
                 xgb_defaults = {'random_state': random_seed, 'n_estimators': 1000, 'learning_rate': 0.05, 'n_jobs': -1}
                 model = xgb.XGBRegressor(**{**xgb_defaults, **model_params}, device="cuda", early_stopping_rounds=15)
                 model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
-                
-            elif model_name == 'ngboost':
-                ngb_defaults = {'random_state': random_seed, 'n_estimators': 1000, 'learning_rate':0.01, 'minibatch_frac':0.5, 'col_sample':0.5}
-                model = NGBRegressor(**{**ngb_defaults, **model_params})
-                model.fit(X_train, y_train)
 
             else: # Default to RandomForest
                 rf_defaults = {'random_state': random_seed, 'n_jobs': -1, 'n_estimators': 100}
