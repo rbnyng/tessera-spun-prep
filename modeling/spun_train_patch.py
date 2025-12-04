@@ -550,7 +550,7 @@ class CombinedPatchClimateEvaluator:
             if model_name == 'lightgbm':
                 lgbm_defaults = {'random_state': random_seed, 'n_estimators': 1000, 'learning_rate': 0.05, 'n_jobs': -1}
                 model = lgb.LGBMRegressor(**{**lgbm_defaults, **model_params}, device='cuda')
-                model.fit(X_train, y_train, callbacks=[lgb.early_stopping(stopping_rounds=15, verbose=False)])
+                model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(stopping_rounds=15, verbose=False)])
 
             elif model_name == 'xgboost':
                 xgb_defaults = {'random_state': random_seed, 'n_estimators': 1000, 'learning_rate': 0.05, 'n_jobs': -1}
@@ -985,41 +985,40 @@ def main_evaluation(args):
             logging.info(f"Run {run_idx} - R2: {stats['r2']:.4f}, R2 (filtered): {stats['r2_filtered_98_percent']:.4f}, MAE: {stats['mae']:.4f}, MedAE: {stats['medae']:.4f}")
         else:
             logging.warning(f"Run {run_idx} - Failed: {run_result.get('error', 'Unknown')}")
-            
-        # --- Summarize Results ---
-        successful_runs = [r for r in all_run_results if 'error' not in r]
-        if successful_runs:
-            save_per_run_performance(all_run_results, run_dir)
-            
-            # Collect all metrics from each run
-            r2_scores = [r['test_stats']['r2'] for r in successful_runs]
-            mae_scores = [r['test_stats']['mae'] for r in successful_runs]
-            medae_scores = [r['test_stats']['medae'] for r in successful_runs]
-            r2_filtered_scores = [r['test_stats']['r2_filtered_98_percent'] for r in successful_runs]
-            me_scores = [r['test_stats']['me'] for r in successful_runs]
-            rmse_scores = [r['test_stats']['rmse'] for r in successful_runs]
 
-            mean_r2 = np.mean(r2_scores)
-            summary_stats = {
-                'model_type': MODEL_TO_USE,
-                'satellite_dim_reduction': SATELLITE_DIM_REDUCTION,
-                'num_samples': len(X_combined),
-                'num_features': X_combined.shape[1],
-                'num_successful_runs': len(successful_runs),
-                'r2_mean': float(np.mean(r2_scores)), 'r2_std': float(np.std(r2_scores)),
-                'rmse_mean': float(np.mean(rmse_scores)), 'rmse_std': float(np.std(rmse_scores)),
-                'mae_mean': float(np.mean(mae_scores)), 'mae_std': float(np.std(mae_scores)),
-                'me_mean': float(np.mean(me_scores)), 'me_std': float(np.std(me_scores)),
-                'medae_mean': float(np.mean(medae_scores)), 'medae_std': float(np.std(medae_scores)),
-                'r2_filtered_98_percent_mean': float(np.mean(r2_filtered_scores)), 'r2_filtered_98_percent_std': float(np.std(r2_filtered_scores))
-            }
-        
+    # --- Summarize Results ---
+    successful_runs = [r for r in all_run_results if 'error' not in r]
+    if successful_runs:
+        save_per_run_performance(all_run_results, run_dir)
+
+        # Collect all metrics from each run
+        r2_scores = [r['test_stats']['r2'] for r in successful_runs]
+        mae_scores = [r['test_stats']['mae'] for r in successful_runs]
+        medae_scores = [r['test_stats']['medae'] for r in successful_runs]
+        r2_filtered_scores = [r['test_stats']['r2_filtered_98_percent'] for r in successful_runs]
+        me_scores = [r['test_stats']['me'] for r in successful_runs]
+        rmse_scores = [r['test_stats']['rmse'] for r in successful_runs]
+
+        mean_r2 = np.mean(r2_scores)
+        summary_stats = {
+            'model_type': MODEL_TO_USE,
+            'satellite_dim_reduction': SATELLITE_DIM_REDUCTION,
+            'num_samples': len(X_combined),
+            'num_features': X_combined.shape[1],
+            'num_successful_runs': len(successful_runs),
+            'r2_mean': float(np.mean(r2_scores)), 'r2_std': float(np.std(r2_scores)),
+            'rmse_mean': float(np.mean(rmse_scores)), 'rmse_std': float(np.std(rmse_scores)),
+            'mae_mean': float(np.mean(mae_scores)), 'mae_std': float(np.std(mae_scores)),
+            'me_mean': float(np.mean(me_scores)), 'me_std': float(np.std(me_scores)),
+            'medae_mean': float(np.mean(medae_scores)), 'medae_std': float(np.std(medae_scores)),
+            'r2_filtered_98_percent_mean': float(np.mean(r2_filtered_scores)), 'r2_filtered_98_percent_std': float(np.std(r2_filtered_scores))
+        }
+
         print("\n--- Overall Summary ---")
         print(json.dumps(summary_stats, indent=2))
         summary_file = run_dir / "evaluation_summary.json"
         with open(summary_file, 'w') as f: json.dump(summary_stats, f, indent=2)
         print(f"\nSummary saved to {summary_file}")
-        
     else:
         print("\nNo successful evaluation runs completed.")
         
