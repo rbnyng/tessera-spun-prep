@@ -35,9 +35,6 @@ logging.basicConfig(
 )
 
 class ClimateExtractor:
-    """
-    Climate data extractor that handles monthly, static, and generated topography data.
-    """
     def __init__(self, climate_data_path, use_cache=True):
         self.climate_data_path = Path(climate_data_path)
         self.use_cache = use_cache
@@ -53,10 +50,6 @@ class ClimateExtractor:
         self._load_climate_metadata()
 
     def _generate_topography_layers(self):
-        """
-        Checks for slope/aspect GeoTIFFs and generates them using richdem if they are missing.
-        This is a one-time preprocessing step.
-        """
         logging.info("Checking for topography layers (slope, aspect)...")
         elev_path = self.climate_data_path / "wc2.1_30s_elev.tif"
         slope_path = self.climate_data_path / "wc2.1_30s_slope.tif"
@@ -98,7 +91,6 @@ class ClimateExtractor:
             logging.error(f"An error occurred during topography generation: {e}", exc_info=True)
 
     def _load_climate_metadata(self):
-        """Load metadata for all available climate data files (monthly and static)."""
         if self.use_cache and self.cache_file.exists():
             try:
                 with open(self.cache_file, 'rb') as f:
@@ -139,7 +131,6 @@ class ClimateExtractor:
         else: logging.error("Failed to load any climate metadata!")
 
     def extract_climate_features(self, lat, lon):
-        """Extracts features from monthly, static, and generated topography layers."""
         features = {}
         if not (-90 <= lat <= 90 and -180 <= lon <= 180): return {}
         # Process Monthly Variables (code is unchanged)
@@ -183,7 +174,6 @@ class ClimateExtractor:
         return features
         
 class CombinedPatchClimateEvaluator:
-    """Prepares data and evaluates traditional ML models with optional PCA/UMAP for satellite features."""
     def __init__(self, climate_data_path, use_climate_cache, climate_features_cache_dir, soil_features_cache_dir):
         self.climate_extractor = None
         if climate_data_path:
@@ -269,13 +259,6 @@ class CombinedPatchClimateEvaluator:
                         ) -> Tuple[
                             Optional[np.ndarray], Optional[np.ndarray], Optional[List[Dict]], 
                             Optional[List[Dict]], Optional[Tuple[int, int, int]], Optional[List[str]]]:
-        """
-        Prepares dataset using satellite, climate, or both, with optional dimensionality reduction.
-        
-        Parameters:
-        - satellite_dim_reduction: 'none', 'pca', or 'umap'
-        - dim_reduction_components: number of components (auto-select if None)
-        """
         all_skipped_locations = []
         biodiversity_df['sample_id'] = biodiversity_df['sample_id'].astype(str)
         current_merged_df = biodiversity_df[['sample_id', 'latitude', 'longitude', 'rarefied']].copy()
@@ -542,23 +525,37 @@ class CombinedPatchClimateEvaluator:
         if X is None or y is None or len(X) == 0: return {'error': 'Empty training data'}
         model_params = model_params or {}
         
-        X_train, X_test, y_train, y_test, _, info_test = train_test_split(
+        # X_train, X_test, y_train, y_test, _, info_test = train_test_split(
+            # X, y, location_info, test_size=0.2, random_state=random_seed
+        # )
+        
+        # Three-way data split (train/validation/test)
+        # First, split into training+validation (80%) and test (20%)
+        X_train_val, X_test, y_train_val, y_test, _, info_test = train_test_split(
             X, y, location_info, test_size=0.2, random_state=random_seed
         )
+        
+        # Then, split the 80% into training (70% of total) and validation (10% of total)
+        # The new test_size is 0.1 / 0.8 = 0.125
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_train_val, y_train_val, test_size=0.125, random_state=random_seed
+        )
+
+        logging.info(f"Data split: {len(X_train)} train, {len(X_val)} validation, {len(X_test)} test samples.")
         
         model = None
         logging.info(f"Training with model: {model_name.upper()}")
 
         try:
             if model_name == 'lightgbm':
-                lgbm_defaults = {'random_state': random_seed, 'n_estimators': 1000, 'learning_rate': 0.005, 'n_jobs': -1}
+                lgbm_defaults = {'random_state': random_seed, 'n_estimators': 1000, 'learning_rate': 0.05, 'n_jobs': -1}
                 model = lgb.LGBMRegressor(**{**lgbm_defaults, **model_params}, device='cuda')
-                model.fit(X_train, y_train, eval_set=[(X_test, y_test)], eval_metric='l1', callbacks=[lgb.early_stopping(15, verbose=False)])
+                model.fit(X_train, y_train, callbacks=[lgb.early_stopping(stopping_rounds=15, verbose=False)])
 
             elif model_name == 'xgboost':
                 xgb_defaults = {'random_state': random_seed, 'n_estimators': 1000, 'learning_rate': 0.05, 'n_jobs': -1}
-                model = xgb.XGBRegressor(**{**xgb_defaults, **model_params}, device="cuda", early_stopping_rounds=15)
-                model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+                model = xgb.XGBRegressor(**{**xgb_defaults, **model_params}, device="cuda")
+                model.fit(X_train, y_train, verbose=False, eval_set=[(X_val, y_val)], early_stopping_rounds=15)
 
             else: # Default to RandomForest
                 rf_defaults = {'random_state': random_seed, 'n_jobs': -1, 'n_estimators': 100}
@@ -583,7 +580,7 @@ class CombinedPatchClimateEvaluator:
             # Filter out the top 2% of largest errors
             filtered_df = error_df[error_df['abs_error'] <= error_threshold]
             r2_filtered = r2_score(filtered_df['actual'], filtered_df['pred'])
-                        
+        
             return {
                 'model_type': model_name,
                 'random_seed': random_seed,
@@ -919,12 +916,6 @@ def main_evaluation(args):
         logging.info(f"Loaded and cleaned {len(biodiversity_df)} total records.")
     except Exception as e:
         logging.error(f"Failed to load data: {e}"); return
-    
-    # Deduplicate by averaging rarefied and grouping by (lat, lon)
-    # biodiversity_df = biodiversity_df.groupby(['latitude', 'longitude'], as_index=False).agg({
-        # 'rarefied': 'mean',
-        # 'sample_id': 'first'
-    # })
     
     # --- Applying bounding box filter ---
     if USE_BBOX_FILTER and BOUNDING_BOXES:
