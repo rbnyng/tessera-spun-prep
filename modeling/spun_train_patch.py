@@ -34,6 +34,258 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
+class BiomeFilter:
+    ECOREGIONS_URL = "https://storage.googleapis.com/teow2016/Ecoregions2017.zip"
+
+    def __init__(self, cache_dir: Optional[Path] = None):
+        self.cache_dir = cache_dir or Path(tempfile.gettempdir()) / "ecoregions_cache"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.ecoregions_gdf = None
+
+    def _download_ecoregions(self) -> Path:
+        zip_path = self.cache_dir / "Ecoregions2017.zip"
+        extract_dir = self.cache_dir / "Ecoregions2017"
+
+        # Check if already downloaded and extracted
+        shapefile_path = extract_dir / "Ecoregions2017.shp"
+        if shapefile_path.exists():
+            logging.info(f"Using cached ecoregions data at {shapefile_path}")
+            return extract_dir
+
+        # Download the shapefile
+        logging.info(f"Downloading RESOLVE Ecoregions from {self.ECOREGIONS_URL}...")
+        try:
+            response = requests.get(self.ECOREGIONS_URL, stream=True, timeout=300)
+            response.raise_for_status()
+
+            with open(zip_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            logging.info(f"Downloaded to {zip_path}")
+
+            # Extract the zipfile
+            logging.info("Extracting shapefile...")
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
+
+            logging.info(f"Extracted to {extract_dir}")
+            return extract_dir
+
+        except Exception as e:
+            logging.error(f"Failed to download/extract ecoregions: {e}")
+            raise
+
+    def load_ecoregions(self) -> geopandas.GeoDataFrame:
+        if self.ecoregions_gdf is not None:
+            return self.ecoregions_gdf
+
+        extract_dir = self._download_ecoregions()
+        shapefile_path = extract_dir / "Ecoregions2017.shp"
+
+        logging.info(f"Loading ecoregions shapefile from {shapefile_path}...")
+        try:
+            self.ecoregions_gdf = geopandas.read_file(shapefile_path)
+            logging.info(f"Loaded {len(self.ecoregions_gdf)} ecoregions")
+
+            # Log available columns for reference
+            logging.info(f"Available columns: {self.ecoregions_gdf.columns.tolist()}")
+
+            # Ensure CRS is WGS84 (EPSG:4326) for lat/lon matching
+            if self.ecoregions_gdf.crs is None:
+                logging.warning("Ecoregions GeoDataFrame has no CRS, assuming EPSG:4326")
+                self.ecoregions_gdf.set_crs(epsg=4326, inplace=True)
+            elif self.ecoregions_gdf.crs.to_epsg() != 4326:
+                logging.info(f"Reprojecting from {self.ecoregions_gdf.crs} to EPSG:4326")
+                self.ecoregions_gdf = self.ecoregions_gdf.to_crs(epsg=4326)
+
+            return self.ecoregions_gdf
+
+        except Exception as e:
+            logging.error(f"Failed to load ecoregions shapefile: {e}")
+            raise
+
+    def assign_biomes(self, df: pd.DataFrame) -> pd.DataFrame:
+        logging.info("Assigning biomes to samples...")
+
+        # Load ecoregions if not already loaded
+        if self.ecoregions_gdf is None:
+            self.load_ecoregions()
+
+        # Create GeoDataFrame from sample locations
+        geometry = [Point(lon, lat) for lon, lat in zip(df['longitude'], df['latitude'])]
+        samples_gdf = geopandas.GeoDataFrame(
+            df.copy(),
+            geometry=geometry,
+            crs="EPSG:4326"
+        )
+
+        # Spatial join to assign biomes
+        # Use 'left' join to keep all samples, even if they don't intersect any ecoregion
+        logging.info("Performing spatial join with ecoregions...")
+        joined = geopandas.sjoin(
+            samples_gdf,
+            self.ecoregions_gdf[['BIOME_NAME', 'BIOME_NUM', 'geometry']],
+            how='left',
+            predicate='within'
+        )
+
+        # Drop the geometry column and index_right from the join
+        result_df = pd.DataFrame(joined.drop(columns=['geometry', 'index_right']))
+
+        # Log statistics
+        total_samples = len(result_df)
+        assigned_samples = result_df['BIOME_NAME'].notna().sum()
+        logging.info(f"Assigned biomes to {assigned_samples}/{total_samples} samples")
+
+        if assigned_samples < total_samples:
+            logging.warning(
+                f"{total_samples - assigned_samples} samples could not be assigned to a biome "
+                "(they may be in areas not covered by the ecoregions dataset)"
+            )
+
+        return result_df
+
+    def filter_by_biome_outliers(
+        self,
+        df: pd.DataFrame,
+        richness_column: str = 'rarefied',
+        iqr_multiplier: float = 5.0,
+        remove_unassigned: bool = True
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        logging.info(
+            f"Filtering samples by biome outliers "
+            f"(threshold: median + {iqr_multiplier} * IQR)..."
+        )
+
+        # Ensure biomes are assigned
+        if 'BIOME_NAME' not in df.columns or 'BIOME_NUM' not in df.columns:
+            logging.info("Biome columns not found, assigning biomes first...")
+            df = self.assign_biomes(df)
+
+        initial_count = len(df)
+
+        # Handle samples without biome assignment
+        unassigned_mask = df['BIOME_NAME'].isna()
+        unassigned_count = unassigned_mask.sum()
+
+        if unassigned_count > 0:
+            if remove_unassigned:
+                logging.info(f"Removing {unassigned_count} samples without biome assignment")
+                df = df[~unassigned_mask].copy()
+            else:
+                logging.warning(
+                    f"Keeping {unassigned_count} samples without biome assignment "
+                    "(they will not be filtered by biome statistics)"
+                )
+
+        # Calculate biome-level statistics
+        logging.info("Calculating biome-level statistics...")
+        biome_stats = df.groupby('BIOME_NAME')[richness_column].agg([
+            ('median', 'median'),
+            ('q25', lambda x: x.quantile(0.25)),
+            ('q75', lambda x: x.quantile(0.75)),
+            ('count', 'count'),
+            ('mean', 'mean'),
+            ('std', 'std')
+        ]).reset_index()
+
+        # Calculate IQR and threshold
+        biome_stats['iqr'] = biome_stats['q75'] - biome_stats['q25']
+        biome_stats['upper_threshold'] = (
+            biome_stats['median'] + iqr_multiplier * biome_stats['iqr']
+        )
+
+        # Log biome statistics
+        logging.info("\nBiome statistics:")
+        for _, row in biome_stats.iterrows():
+            logging.info(
+                f"  {row['BIOME_NAME']}: "
+                f"n={int(row['count'])}, "
+                f"median={row['median']:.2f}, "
+                f"IQR={row['iqr']:.2f}, "
+                f"threshold={row['upper_threshold']:.2f}"
+            )
+
+        # Merge threshold back to main dataframe
+        df = df.merge(
+            biome_stats[['BIOME_NAME', 'upper_threshold']],
+            on='BIOME_NAME',
+            how='left'
+        )
+
+        # Identify outliers
+        # For unassigned samples (if kept), upper_threshold will be NaN, so they won't be filtered
+        outlier_mask = df[richness_column] > df['upper_threshold']
+        outliers = df[outlier_mask].copy()
+        filtered_df = df[~outlier_mask].copy()
+
+        # Clean up temporary column
+        filtered_df = filtered_df.drop(columns=['upper_threshold'])
+        if len(outliers) > 0:
+            outliers = outliers.drop(columns=['upper_threshold'])
+
+        removed_count = len(outliers)
+        logging.info(
+            f"\nFiltering complete: "
+            f"Removed {removed_count} outliers "
+            f"({removed_count/initial_count*100:.1f}% of initial samples)"
+        )
+        logging.info(f"Remaining samples: {len(filtered_df)}/{initial_count}")
+
+        # Log outliers by biome
+        if removed_count > 0:
+            outliers_by_biome = outliers.groupby('BIOME_NAME').size()
+            logging.info("\nOutliers removed per biome:")
+            for biome, count in outliers_by_biome.items():
+                logging.info(f"  {biome}: {count}")
+
+        return filtered_df, outliers
+
+    def apply_filter(
+        self,
+        df: pd.DataFrame,
+        richness_column: str = 'rarefied',
+        iqr_multiplier: float = 5.0,
+        remove_unassigned: bool = True,
+        save_removed: Optional[Path] = None
+    ) -> pd.DataFrame:
+        # Assign biomes
+        df_with_biomes = self.assign_biomes(df)
+
+        # Filter outliers
+        filtered_df, removed_df = self.filter_by_biome_outliers(
+            df_with_biomes,
+            richness_column=richness_column,
+            iqr_multiplier=iqr_multiplier,
+            remove_unassigned=remove_unassigned
+        )
+
+        # Optionally save removed samples
+        if save_removed and len(removed_df) > 0:
+            removed_df.to_csv(save_removed, index=False)
+            logging.info(f"Saved {len(removed_df)} removed samples to {save_removed}")
+
+        return filtered_df
+
+def filter_by_biome(
+    df: pd.DataFrame,
+    richness_column: str = 'rarefied',
+    iqr_multiplier: float = 5.0,
+    remove_unassigned: bool = True,
+    cache_dir: Optional[Path] = None,
+    save_removed: Optional[Path] = None
+) -> pd.DataFrame:
+    biome_filter = BiomeFilter(cache_dir=cache_dir)
+    return biome_filter.apply_filter(
+        df,
+        richness_column=richness_column,
+        iqr_multiplier=iqr_multiplier,
+        remove_unassigned=remove_unassigned,
+        save_removed=save_removed
+    )
+
 class ClimateExtractor:
     def __init__(self, climate_data_path, use_cache=True):
         self.climate_data_path = Path(climate_data_path)
@@ -945,7 +1197,42 @@ def main_evaluation(args):
         
         if len(biodiversity_df) == 0:
             logging.error("No records remain after filtering. Aborting."); return
-            
+
+    # --- Apply Biome-Based Filtering ---
+    USE_BIOME_FILTER = args.use_biome_filter
+    BIOME_IQR_MULTIPLIER = args.biome_iqr_multiplier
+    BIOME_CACHE_DIR = Path(args.biome_cache_dir) if args.biome_cache_dir else None
+
+    if USE_BIOME_FILTER:
+        logging.info(f"Applying biome-based outlier filtering (IQR multiplier: {BIOME_IQR_MULTIPLIER})...")
+        initial_count = len(biodiversity_df)
+
+        # Save removed samples if requested
+        removed_samples_path = None
+        if args.save_biome_removed:
+            removed_samples_path = run_dir / "biome_filtered_samples.csv"
+
+        try:
+            biodiversity_df = filter_by_biome(
+                biodiversity_df,
+                richness_column='rarefied',
+                iqr_multiplier=BIOME_IQR_MULTIPLIER,
+                remove_unassigned=args.biome_remove_unassigned,
+                cache_dir=BIOME_CACHE_DIR,
+                save_removed=removed_samples_path
+            )
+            logging.info(
+                f"Biome filtering complete. "
+                f"Kept {len(biodiversity_df)}/{initial_count} samples "
+                f"({len(biodiversity_df)/initial_count*100:.1f}%)"
+            )
+        except Exception as e:
+            logging.error(f"Biome filtering failed: {e}", exc_info=True)
+            logging.warning("Continuing without biome filtering...")
+
+        if len(biodiversity_df) == 0:
+            logging.error("No records remain after biome filtering. Aborting."); return
+
     # --- Prepare Dataset ---    
     evaluator = CombinedPatchClimateEvaluator(
         climate_data_path=CLIMATE_DATA_PATH,
@@ -1065,6 +1352,13 @@ if __name__ == "__main__":
     # --- Dimensionality Reduction ---
     parser.add_argument('--dim_reduction', type=str, default='umap', choices=['none', 'pca', 'umap'], help='Dimensionality reduction for satellite features')
     parser.add_argument('--dim_reduction_components', type=int, default=256, help='Number of components for dimensionality reduction')
+
+    # --- Biome Filtering ---
+    parser.add_argument('--use-biome-filter', action='store_true', default=False, help='Enable biome-based outlier filtering')
+    parser.add_argument('--biome-iqr-multiplier', type=float, default=5.0, help='IQR multiplier for biome outlier threshold (default: 5.0)')
+    parser.add_argument('--biome-cache-dir', type=str, default='/scratch/ray25/ecoregions_cache', help='Directory to cache RESOLVE Ecoregions data')
+    parser.add_argument('--biome-remove-unassigned', action='store_true', default=True, help='Remove samples that cannot be assigned to a biome')
+    parser.add_argument('--save-biome-removed', action='store_true', default=False, help='Save removed biome outliers to CSV')
 
     # --- Path Configs ---
     parser.add_argument('--biodiversity_csvs', nargs='+', default=["/maps-priv/maps/ray25/data/spun_data/ECM_richness_europe.csv", "/maps-priv/maps/ray25/data/spun_data/ECM_richness_Asia.csv"])
