@@ -994,6 +994,7 @@ def analyze_and_save_spatial_error_maps(run_result, run_dir):
     error_df['actual_rarefied'] = data['y_test']
     error_df['predicted_rarefied'] = data['test_pred']
     error_df['absolute_error'] = abs(error_df['actual_rarefied'] - error_df['predicted_rarefied'])
+    error_df['percent_error'] = (error_df['absolute_error'] / error_df['actual_rarefied']) * 100
 
     # Create the GeoDataFrame
     gdf = geopandas.GeoDataFrame(
@@ -1067,6 +1068,35 @@ def analyze_and_save_spatial_error_maps(run_result, run_dir):
     fig2.savefig(map2_path, dpi=600, bbox_inches='tight')
     plt.close(fig2)
     logging.info(f"Error bubble map saved to {map2_path}")
+
+    # Plot 3: Bubble Map of Percentage Error
+    logging.info("Generating bubble map of percentage errors...")
+    # Scale marker size for percentage error
+    max_percent_error = gdf['percent_error'].max()
+    if max_percent_error > 0:
+        scaled_size_pct = (gdf['percent_error'] / max_percent_error) * 150
+    else:
+        scaled_size_pct = 0
+    marker_sizes_pct = min_marker_size + scaled_size_pct
+
+    fig3, ax3 = plt.subplots(1, 1, figsize=(15, 12))
+    world.plot(ax=ax3, color='#e0e0e0', edgecolor='black', linewidth=0.5)
+    gdf.plot(ax=ax3,
+             column='percent_error',
+             cmap='plasma',
+             markersize=marker_sizes_pct,
+             legend=True,
+             legend_kwds={'label': "Percent Error (%)", 'orientation': "horizontal", 'pad': 0.01},
+             alpha=0.75)
+    ax3.set_title('Bubble Map of Percent Error in Predictions')
+    ax3.set_xlabel('Longitude')
+    ax3.set_ylabel('Latitude')
+    ax3.set_xlim(*plot_bounds['xlim'])
+    ax3.set_ylim(*plot_bounds['ylim'])
+    map3_path = run_dir / "spatial_percent_error_bubble_map.png"
+    fig3.savefig(map3_path, dpi=600, bbox_inches='tight')
+    plt.close(fig3)
+    logging.info(f"Percent error bubble map saved to {map3_path}")
 
 def save_per_run_performance(all_run_results: List[Dict[str, Any]], run_dir: Path):
     logging.info("--- Saving Per-Run Performance Metrics ---")
