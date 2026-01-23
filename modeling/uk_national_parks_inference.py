@@ -162,7 +162,8 @@ def download_embeddings_for_park(config: Config, park_name: str, year: int, aoi_
     embeddings_dir = config.get_embeddings_dir(park_name, year)
     embeddings_dir.mkdir(parents=True, exist_ok=True)
 
-    if any(embeddings_dir.rglob('*.tif')) or any(embeddings_dir.rglob('*.tiff')):
+    # geotessera creates subdirs; we want files from *tiff_all* directory specifically
+    if any(embeddings_dir.glob('*tiff_all/*.tiff')) or any(embeddings_dir.glob('*tiff_all/*.tif')):
         print(f"  Embeddings for {park_name} {year} already exist. Skipping download.")
         return
 
@@ -195,7 +196,8 @@ def create_mosaic(config: Config, park_name: str, year: int):
         print(f"  Mosaic for {park_name} {year} already exists. Skipping.")
         return
 
-    embedding_files = list(embeddings_dir.rglob('*.tif')) + list(embeddings_dir.rglob('*.tiff'))
+    # geotessera creates subdirs; we want files from *tiff_all* directory specifically
+    embedding_files = list(embeddings_dir.glob('*tiff_all/*.tif')) + list(embeddings_dir.glob('*tiff_all/*.tiff'))
     if not embedding_files:
         print(f"  ERROR: No embedding tiles found for {park_name} {year}")
         return
