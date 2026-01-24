@@ -216,7 +216,8 @@ def create_mosaic(config: Config, park_name: str, year: int):
         "height": mosaic_data.shape[1],
         "width": mosaic_data.shape[2],
         "transform": out_transform,
-        "compress": "LZW"
+        "compress": "LZW",
+        "BIGTIFF": "YES"
     })
 
     with rasterio.open(mosaic_path, "w", **out_meta) as dest:
