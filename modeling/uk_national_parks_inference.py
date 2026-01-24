@@ -8,7 +8,7 @@ Parks: Cairngorms, Lake District, Yorkshire Dales
 Years: 2017, 2024 (extensible to full 2017-2024 range)
 
 Usage:
-    python uk_national_parks_inference.py
+    python uk_national_parks_inference.py [--workers N]
 """
 
 import subprocess
@@ -16,7 +16,10 @@ import pickle
 import json
 import zipfile
 import tempfile
+import argparse
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import partial
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -186,10 +189,70 @@ def download_embeddings_for_park(config: Config, park_name: str, year: int, aoi_
         raise
 
 
-def run_inference_per_tile(config: Config, park_name: str, year: int, evaluator, model):
+def process_single_tile(tile_path: Path, predictions_dir: Path, evaluator_path: Path, model_path: Path):
+    """
+    Worker function to process a single tile. Designed for parallel execution.
+    Each worker loads its own copy of the model/evaluator.
+    """
+    pred_tile_path = predictions_dir / f"{tile_path.stem}_pred.tif"
+
+    # Skip if already exists
+    if pred_tile_path.exists():
+        return "skipped"
+
+    try:
+        # Load model in worker (each process needs its own copy)
+        with open(evaluator_path, 'rb') as f:
+            evaluator = pickle.load(f)
+        with open(model_path, 'rb') as f:
+            model = pickle.load(f)
+
+        with rasterio.open(tile_path) as src:
+            tile_data = src.read().transpose(1, 2, 0)  # (H, W, C)
+            profile = src.profile
+
+        h, w, c = tile_data.shape
+
+        # Create 3x3 windows for spatial context
+        padded = np.pad(tile_data, ((1, 1), (1, 1), (0, 0)), mode='constant', constant_values=np.nan)
+        windows = view_as_windows(padded, (3, 3, c), step=1)
+        feature_vectors = windows.reshape(h * w, -1)
+
+        # Filter valid pixels
+        valid_mask = ~np.isnan(feature_vectors).any(axis=1)
+        valid_features = feature_vectors[valid_mask]
+
+        if valid_features.shape[0] == 0:
+            return "empty"
+
+        # Apply model pipeline
+        scaled_pixels = evaluator.scaler.transform(valid_features)
+        reduced_pixels = evaluator.dim_reduction_model.transform(scaled_pixels)
+        predictions_flat = model.predict(reduced_pixels)
+
+        # Reconstruct prediction map
+        final_predictions = np.full(h * w, np.nan, dtype=np.float32)
+        final_predictions[valid_mask] = predictions_flat
+        prediction_map = final_predictions.reshape(h, w)
+
+        # Save prediction tile
+        profile.update(count=1, dtype='float32', nodata=np.nan, compress='LZW')
+        with rasterio.open(pred_tile_path, 'w', **profile) as dst:
+            dst.write(prediction_map, 1)
+
+        return "processed"
+
+    except Exception as e:
+        return f"error: {e}"
+
+
+def run_inference_per_tile(config: Config, park_name: str, year: int, evaluator, model, n_workers: int = 1):
     """
     Run SSL model inference on each embedding tile individually.
     Saves per-tile predictions to a subdirectory.
+
+    Args:
+        n_workers: Number of parallel workers (1 = sequential)
     """
     embeddings_dir = config.get_embeddings_dir(park_name, year)
     predictions_dir = config.get_park_output_dir(park_name) / f"predictions_tiles_{year}"
@@ -203,65 +266,66 @@ def run_inference_per_tile(config: Config, park_name: str, year: int, evaluator,
         print(f"  ERROR: No embedding tiles found for {park_name} {year}")
         return False
 
-    print(f"  Running inference on {len(embedding_files)} tiles...")
-
-    processed = 0
+    # Filter to only tiles that need processing
+    tiles_to_process = []
     skipped = 0
-
-    for i, tile_path in enumerate(embedding_files):
-        # Output prediction tile path
+    for tile_path in embedding_files:
         pred_tile_path = predictions_dir / f"{tile_path.stem}_pred.tif"
-
         if pred_tile_path.exists():
             skipped += 1
-            continue
+        else:
+            tiles_to_process.append(tile_path)
 
-        try:
-            with rasterio.open(tile_path) as src:
-                tile_data = src.read().transpose(1, 2, 0)  # (H, W, C)
-                profile = src.profile
+    print(f"  Running inference on {len(embedding_files)} tiles ({skipped} already done, {len(tiles_to_process)} to process)...")
 
-            h, w, c = tile_data.shape
+    if not tiles_to_process:
+        print(f"  All tiles already processed!")
+        return True
 
-            # Create 3x3 windows for spatial context
-            padded = np.pad(tile_data, ((1, 1), (1, 1), (0, 0)), mode='constant', constant_values=np.nan)
-            windows = view_as_windows(padded, (3, 3, c), step=1)
-            feature_vectors = windows.reshape(h * w, -1)
+    processed = 0
+    errors = 0
 
-            # Filter valid pixels
-            valid_mask = ~np.isnan(feature_vectors).any(axis=1)
-            valid_features = feature_vectors[valid_mask]
+    if n_workers == 1:
+        # Sequential processing (original behavior)
+        for i, tile_path in enumerate(tiles_to_process):
+            result = process_single_tile(
+                tile_path, predictions_dir,
+                config.EVALUATOR_SAVE_PATH, config.MODEL_SSL_ONLY_SAVE_PATH
+            )
+            if result == "processed":
+                processed += 1
+            elif result.startswith("error"):
+                errors += 1
+                print(f"    ERROR: {tile_path.name}: {result}")
 
-            if valid_features.shape[0] == 0:
-                # All NaN tile - skip
-                continue
-
-            # Apply model pipeline
-            scaled_pixels = evaluator.scaler.transform(valid_features)
-            reduced_pixels = evaluator.dim_reduction_model.transform(scaled_pixels)
-            predictions_flat = model.predict(reduced_pixels)
-
-            # Reconstruct prediction map
-            final_predictions = np.full(h * w, np.nan, dtype=np.float32)
-            final_predictions[valid_mask] = predictions_flat
-            prediction_map = final_predictions.reshape(h, w)
-
-            # Save prediction tile
-            profile.update(count=1, dtype='float32', nodata=np.nan, compress='LZW')
-            with rasterio.open(pred_tile_path, 'w', **profile) as dst:
-                dst.write(prediction_map, 1)
-
-            processed += 1
-
-            # Progress update every 10 tiles
             if (i + 1) % 10 == 0:
-                print(f"    Processed {i + 1}/{len(embedding_files)} tiles...")
+                print(f"    Processed {i + 1}/{len(tiles_to_process)} tiles...")
+    else:
+        # Parallel processing
+        print(f"  Using {n_workers} parallel workers...")
+        worker_fn = partial(
+            process_single_tile,
+            predictions_dir=predictions_dir,
+            evaluator_path=config.EVALUATOR_SAVE_PATH,
+            model_path=config.MODEL_SSL_ONLY_SAVE_PATH
+        )
 
-        except Exception as e:
-            print(f"    ERROR processing {tile_path.name}: {e}")
-            continue
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = {executor.submit(worker_fn, tile): tile for tile in tiles_to_process}
 
-    print(f"  Inference complete: {processed} new, {skipped} skipped (already exist)")
+            for i, future in enumerate(as_completed(futures)):
+                result = future.result()
+                if result == "processed":
+                    processed += 1
+                elif result.startswith("error"):
+                    errors += 1
+                    tile = futures[future]
+                    print(f"    ERROR: {tile.name}: {result}")
+
+                if (i + 1) % 20 == 0:
+                    print(f"    Completed {i + 1}/{len(tiles_to_process)} tiles...")
+
+    print(f"  Inference complete: {processed} processed, {skipped} skipped, {errors} errors")
     return True
 
 
@@ -313,7 +377,7 @@ def merge_prediction_tiles(config: Config, park_name: str, year: int):
         print(f"    Richness mean: {valid_preds.mean():.1f}")
 
 
-def process_park(config: Config, park_name: str, evaluator, model):
+def process_park(config: Config, park_name: str, evaluator, model, n_workers: int = 1):
     """
     Full processing pipeline for a single national park.
     """
@@ -348,11 +412,16 @@ def process_park(config: Config, park_name: str, evaluator, model):
     for year in config.YEARS:
         print(f"\n--- Year {year} ---")
         download_embeddings_for_park(config, park_name, year, aoi_path)
-        if run_inference_per_tile(config, park_name, year, evaluator, model):
+        if run_inference_per_tile(config, park_name, year, evaluator, model, n_workers=n_workers):
             merge_prediction_tiles(config, park_name, year)
 
 
 def main():
+    parser = argparse.ArgumentParser(description="UK National Parks Mycorrhizal Richness Prediction")
+    parser.add_argument('--workers', '-w', type=int, default=1,
+                        help='Number of parallel workers for inference (default: 1)')
+    args = parser.parse_args()
+
     print("="*60)
     print("UK National Parks - Mycorrhizal Richness Prediction")
     print("="*60)
@@ -363,7 +432,7 @@ def main():
     print("\nChecking for pre-trained model...")
     ensure_model_exists(config)
 
-    # Load model and evaluator once
+    # Load model and evaluator once (for main process, workers load their own)
     print("\nLoading model and evaluator...")
     with open(config.EVALUATOR_SAVE_PATH, 'rb') as f:
         evaluator = pickle.load(f)
@@ -375,10 +444,11 @@ def main():
     parks_to_process = list(config.PARK_SHAPEFILES.keys())
     print(f"\nParks to process: {parks_to_process}")
     print(f"Years: {config.YEARS}")
+    print(f"Workers: {args.workers}")
 
     for park_name in parks_to_process:
         try:
-            process_park(config, park_name, evaluator, model)
+            process_park(config, park_name, evaluator, model, n_workers=args.workers)
         except Exception as e:
             print(f"\nERROR processing {park_name}: {e}")
             continue
