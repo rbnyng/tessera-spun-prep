@@ -162,8 +162,9 @@ def download_embeddings_for_park(config: Config, park_name: str, year: int, aoi_
     embeddings_dir = config.get_embeddings_dir(park_name, year)
     embeddings_dir.mkdir(parents=True, exist_ok=True)
 
-    # geotessera outputs 128-band files directly with year suffix: grid_*_{year}.tiff
-    if any(embeddings_dir.glob(f'*_{year}.tiff')) or any(embeddings_dir.glob(f'*_{year}.tif')):
+    # geotessera nests files: global_0.1_degree_representation/{year}/grid_*/grid_*_{year}.tiff
+    repr_dir = embeddings_dir / 'global_0.1_degree_representation' / str(year)
+    if repr_dir.exists() and any(repr_dir.glob('*/*.tiff')):
         print(f"  Embeddings for {park_name} {year} already exist. Skipping download.")
         return
 
@@ -196,10 +197,12 @@ def create_mosaic(config: Config, park_name: str, year: int):
         print(f"  Mosaic for {park_name} {year} already exists. Skipping.")
         return
 
-    # geotessera outputs 128-band files directly with year suffix: grid_*_{year}.tiff
-    embedding_files = list(embeddings_dir.glob(f'*_{year}.tif')) + list(embeddings_dir.glob(f'*_{year}.tiff'))
+    # geotessera nests files: global_0.1_degree_representation/{year}/grid_*/grid_*_{year}.tiff
+    repr_dir = embeddings_dir / 'global_0.1_degree_representation' / str(year)
+    embedding_files = list(repr_dir.glob('*/*.tiff')) + list(repr_dir.glob('*/*.tif'))
     if not embedding_files:
         print(f"  ERROR: No embedding tiles found for {park_name} {year}")
+        print(f"         Looked in: {repr_dir}")
         return
 
     print(f"  Creating mosaic from {len(embedding_files)} tiles...")
