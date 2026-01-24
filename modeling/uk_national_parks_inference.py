@@ -18,7 +18,7 @@ import zipfile
 import tempfile
 import argparse
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 import numpy as np
 import pandas as pd
@@ -294,10 +294,11 @@ def run_inference_per_tile(config: Config, park_name: str, year: int, evaluator,
     processed = 0
     errors = 0
 
-    if n_workers == 1:
-        # Sequential processing - initialize globals in main process
-        _init_worker(config.EVALUATOR_SAVE_PATH, config.MODEL_SSL_ONLY_SAVE_PATH)
+    # Initialize model globals (shared by all threads, or used by single worker)
+    _init_worker(config.EVALUATOR_SAVE_PATH, config.MODEL_SSL_ONLY_SAVE_PATH)
 
+    if n_workers == 1:
+        # Sequential processing
         for i, tile_path in enumerate(tiles_to_process):
             result = process_single_tile(tile_path, predictions_dir)
             if result == "processed":
@@ -309,15 +310,11 @@ def run_inference_per_tile(config: Config, park_name: str, year: int, evaluator,
             if (i + 1) % 10 == 0:
                 print(f"    Processed {i + 1}/{len(tiles_to_process)} tiles...")
     else:
-        # Parallel processing - each worker initializes model once via initializer
-        print(f"  Using {n_workers} parallel workers...")
+        # Parallel processing with threads (share memory, no pickling issues)
+        print(f"  Using {n_workers} parallel threads...")
         worker_fn = partial(process_single_tile, predictions_dir=predictions_dir)
 
-        with ProcessPoolExecutor(
-            max_workers=n_workers,
-            initializer=_init_worker,
-            initargs=(config.EVALUATOR_SAVE_PATH, config.MODEL_SSL_ONLY_SAVE_PATH)
-        ) as executor:
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
             futures = {executor.submit(worker_fn, tile): tile for tile in tiles_to_process}
 
             for i, future in enumerate(as_completed(futures)):
