@@ -186,28 +186,106 @@ def download_embeddings_for_park(config: Config, park_name: str, year: int, aoi_
         raise
 
 
-def create_mosaic(config: Config, park_name: str, year: int):
+def run_inference_per_tile(config: Config, park_name: str, year: int, evaluator, model):
     """
-    Merge downloaded embedding tiles into a single mosaic GeoTIFF.
+    Run SSL model inference on each embedding tile individually.
+    Saves per-tile predictions to a subdirectory.
     """
     embeddings_dir = config.get_embeddings_dir(park_name, year)
-    mosaic_path = config.get_mosaic_path(park_name, year)
+    predictions_dir = config.get_park_output_dir(park_name) / f"predictions_tiles_{year}"
+    predictions_dir.mkdir(parents=True, exist_ok=True)
 
-    if mosaic_path.exists():
-        print(f"  Mosaic for {park_name} {year} already exists. Skipping.")
-        return
-
-    # geotessera nests files: global_0.1_degree_representation/{year}/grid_*/grid_*_{year}.tiff
+    # Find embedding tiles
     repr_dir = embeddings_dir / 'global_0.1_degree_representation' / str(year)
     embedding_files = list(repr_dir.glob('*/*.tiff')) + list(repr_dir.glob('*/*.tif'))
+
     if not embedding_files:
         print(f"  ERROR: No embedding tiles found for {park_name} {year}")
-        print(f"         Looked in: {repr_dir}")
+        return False
+
+    print(f"  Running inference on {len(embedding_files)} tiles...")
+
+    processed = 0
+    skipped = 0
+
+    for i, tile_path in enumerate(embedding_files):
+        # Output prediction tile path
+        pred_tile_path = predictions_dir / f"{tile_path.stem}_pred.tif"
+
+        if pred_tile_path.exists():
+            skipped += 1
+            continue
+
+        try:
+            with rasterio.open(tile_path) as src:
+                tile_data = src.read().transpose(1, 2, 0)  # (H, W, C)
+                profile = src.profile
+
+            h, w, c = tile_data.shape
+
+            # Create 3x3 windows for spatial context
+            padded = np.pad(tile_data, ((1, 1), (1, 1), (0, 0)), mode='constant', constant_values=np.nan)
+            windows = view_as_windows(padded, (3, 3, c), step=1)
+            feature_vectors = windows.reshape(h * w, -1)
+
+            # Filter valid pixels
+            valid_mask = ~np.isnan(feature_vectors).any(axis=1)
+            valid_features = feature_vectors[valid_mask]
+
+            if valid_features.shape[0] == 0:
+                # All NaN tile - skip
+                continue
+
+            # Apply model pipeline
+            scaled_pixels = evaluator.scaler.transform(valid_features)
+            reduced_pixels = evaluator.dim_reduction_model.transform(scaled_pixels)
+            predictions_flat = model.predict(reduced_pixels)
+
+            # Reconstruct prediction map
+            final_predictions = np.full(h * w, np.nan, dtype=np.float32)
+            final_predictions[valid_mask] = predictions_flat
+            prediction_map = final_predictions.reshape(h, w)
+
+            # Save prediction tile
+            profile.update(count=1, dtype='float32', nodata=np.nan, compress='LZW')
+            with rasterio.open(pred_tile_path, 'w', **profile) as dst:
+                dst.write(prediction_map, 1)
+
+            processed += 1
+
+            # Progress update every 10 tiles
+            if (i + 1) % 10 == 0:
+                print(f"    Processed {i + 1}/{len(embedding_files)} tiles...")
+
+        except Exception as e:
+            print(f"    ERROR processing {tile_path.name}: {e}")
+            continue
+
+    print(f"  Inference complete: {processed} new, {skipped} skipped (already exist)")
+    return True
+
+
+def merge_prediction_tiles(config: Config, park_name: str, year: int):
+    """
+    Merge per-tile predictions into a single prediction GeoTIFF.
+    Only merges single-band predictions (much lower memory than 128-band embeddings).
+    """
+    predictions_dir = config.get_park_output_dir(park_name) / f"predictions_tiles_{year}"
+    final_prediction_path = config.get_prediction_path(park_name, year)
+
+    if final_prediction_path.exists():
+        print(f"  Final prediction for {park_name} {year} already exists. Skipping merge.")
         return
 
-    print(f"  Creating mosaic from {len(embedding_files)} tiles...")
+    pred_tiles = list(predictions_dir.glob('*_pred.tif'))
+    if not pred_tiles:
+        print(f"  ERROR: No prediction tiles found to merge for {park_name} {year}")
+        return
 
-    src_files = [rasterio.open(fp) for fp in embedding_files]
+    print(f"  Merging {len(pred_tiles)} prediction tiles...")
+
+    # Open all prediction tiles
+    src_files = [rasterio.open(fp) for fp in pred_tiles]
     mosaic_data, out_transform = merge(src_files)
 
     out_meta = src_files[0].meta.copy()
@@ -217,74 +295,22 @@ def create_mosaic(config: Config, park_name: str, year: int):
         "width": mosaic_data.shape[2],
         "transform": out_transform,
         "compress": "LZW",
-        "BIGTIFF": "YES"
+        "BIGTIFF": "IF_SAFER"
     })
 
-    with rasterio.open(mosaic_path, "w", **out_meta) as dest:
+    with rasterio.open(final_prediction_path, "w", **out_meta) as dest:
         dest.write(mosaic_data)
 
     for src in src_files:
         src.close()
 
-    print(f"  Mosaic saved: {mosaic_path}")
-
-
-def run_inference(config: Config, park_name: str, year: int, evaluator, model):
-    """
-    Run SSL model inference on a mosaic to produce a prediction TIF.
-    """
-    mosaic_path = config.get_mosaic_path(park_name, year)
-    prediction_path = config.get_prediction_path(park_name, year)
-
-    if prediction_path.exists():
-        print(f"  Prediction for {park_name} {year} already exists. Skipping.")
-        return
-
-    if not mosaic_path.exists():
-        print(f"  ERROR: Mosaic not found for {park_name} {year}")
-        return
-
-    print(f"  Running inference for {park_name} {year}...")
-
-    with rasterio.open(mosaic_path) as src:
-        mosaic_np = src.read().transpose(1, 2, 0)  # (H, W, C)
-        profile = src.profile
-
-    h, w, c = mosaic_np.shape
-    print(f"    Mosaic shape: {h} x {w} pixels, {c} bands")
-
-    # Create 3x3 windows for spatial context
-    padded_mosaic = np.pad(mosaic_np, ((1, 1), (1, 1), (0, 0)), mode='constant', constant_values=np.nan)
-    windows = view_as_windows(padded_mosaic, (3, 3, c), step=1)
-    feature_vectors = windows.reshape(h * w, -1)
-
-    # Filter valid pixels
-    valid_mask = ~np.isnan(feature_vectors).any(axis=1)
-    valid_features = feature_vectors[valid_mask]
-
-    print(f"    Valid pixels: {valid_features.shape[0]:,} / {h * w:,}")
-
-    # Apply model pipeline
-    scaled_pixels = evaluator.scaler.transform(valid_features)
-    reduced_pixels = evaluator.dim_reduction_model.transform(scaled_pixels)
-    predictions_flat = model.predict(reduced_pixels)
-
-    # Reconstruct prediction map
-    final_predictions = np.full(h * w, np.nan, dtype=np.float32)
-    final_predictions[valid_mask] = predictions_flat
-    prediction_map = final_predictions.reshape(h, w)
-
-    # Save prediction TIF
-    profile.update(count=1, dtype='float32', nodata=np.nan)
-    with rasterio.open(prediction_path, 'w', **profile) as dst:
-        dst.write(prediction_map, 1)
-
-    print(f"  Prediction saved: {prediction_path}")
+    print(f"  Final prediction saved: {final_prediction_path}")
 
     # Print stats
-    valid_preds = prediction_map[~np.isnan(prediction_map)]
-    print(f"    Richness range: {valid_preds.min():.1f} - {valid_preds.max():.1f}")
-    print(f"    Richness mean: {valid_preds.mean():.1f}")
+    valid_preds = mosaic_data[~np.isnan(mosaic_data)]
+    if valid_preds.size > 0:
+        print(f"    Richness range: {valid_preds.min():.1f} - {valid_preds.max():.1f}")
+        print(f"    Richness mean: {valid_preds.mean():.1f}")
 
 
 def process_park(config: Config, park_name: str, evaluator, model):
@@ -322,8 +348,8 @@ def process_park(config: Config, park_name: str, evaluator, model):
     for year in config.YEARS:
         print(f"\n--- Year {year} ---")
         download_embeddings_for_park(config, park_name, year, aoi_path)
-        create_mosaic(config, park_name, year)
-        run_inference(config, park_name, year, evaluator, model)
+        if run_inference_per_tile(config, park_name, year, evaluator, model):
+            merge_prediction_tiles(config, park_name, year)
 
 
 def main():
