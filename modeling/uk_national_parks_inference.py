@@ -29,6 +29,19 @@ from rasterio.transform import from_origin
 from skimage.util import view_as_windows
 import geopandas as gpd
 
+# Global variables for worker processes (initialized once per worker)
+_worker_evaluator = None
+_worker_model = None
+
+
+def _init_worker(evaluator_path: Path, model_path: Path):
+    """Initialize worker process by loading model once."""
+    global _worker_evaluator, _worker_model
+    with open(evaluator_path, 'rb') as f:
+        _worker_evaluator = pickle.load(f)
+    with open(model_path, 'rb') as f:
+        _worker_model = pickle.load(f)
+
 
 class Config:
     # === Training/Model Paths (existing infrastructure) ===
@@ -189,11 +202,13 @@ def download_embeddings_for_park(config: Config, park_name: str, year: int, aoi_
         raise
 
 
-def process_single_tile(tile_path: Path, predictions_dir: Path, evaluator_path: Path, model_path: Path):
+def process_single_tile(tile_path: Path, predictions_dir: Path):
     """
     Worker function to process a single tile. Designed for parallel execution.
-    Each worker loads its own copy of the model/evaluator.
+    Uses global _worker_evaluator and _worker_model (loaded once per worker via initializer).
     """
+    global _worker_evaluator, _worker_model
+
     pred_tile_path = predictions_dir / f"{tile_path.stem}_pred.tif"
 
     # Skip if already exists
@@ -201,12 +216,6 @@ def process_single_tile(tile_path: Path, predictions_dir: Path, evaluator_path: 
         return "skipped"
 
     try:
-        # Load model in worker (each process needs its own copy)
-        with open(evaluator_path, 'rb') as f:
-            evaluator = pickle.load(f)
-        with open(model_path, 'rb') as f:
-            model = pickle.load(f)
-
         with rasterio.open(tile_path) as src:
             tile_data = src.read().transpose(1, 2, 0)  # (H, W, C)
             profile = src.profile
@@ -226,9 +235,9 @@ def process_single_tile(tile_path: Path, predictions_dir: Path, evaluator_path: 
             return "empty"
 
         # Apply model pipeline
-        scaled_pixels = evaluator.scaler.transform(valid_features)
-        reduced_pixels = evaluator.dim_reduction_model.transform(scaled_pixels)
-        predictions_flat = model.predict(reduced_pixels)
+        scaled_pixels = _worker_evaluator.scaler.transform(valid_features)
+        reduced_pixels = _worker_evaluator.dim_reduction_model.transform(scaled_pixels)
+        predictions_flat = _worker_model.predict(reduced_pixels)
 
         # Reconstruct prediction map
         final_predictions = np.full(h * w, np.nan, dtype=np.float32)
@@ -286,12 +295,11 @@ def run_inference_per_tile(config: Config, park_name: str, year: int, evaluator,
     errors = 0
 
     if n_workers == 1:
-        # Sequential processing (original behavior)
+        # Sequential processing - initialize globals in main process
+        _init_worker(config.EVALUATOR_SAVE_PATH, config.MODEL_SSL_ONLY_SAVE_PATH)
+
         for i, tile_path in enumerate(tiles_to_process):
-            result = process_single_tile(
-                tile_path, predictions_dir,
-                config.EVALUATOR_SAVE_PATH, config.MODEL_SSL_ONLY_SAVE_PATH
-            )
+            result = process_single_tile(tile_path, predictions_dir)
             if result == "processed":
                 processed += 1
             elif result.startswith("error"):
@@ -301,16 +309,15 @@ def run_inference_per_tile(config: Config, park_name: str, year: int, evaluator,
             if (i + 1) % 10 == 0:
                 print(f"    Processed {i + 1}/{len(tiles_to_process)} tiles...")
     else:
-        # Parallel processing
+        # Parallel processing - each worker initializes model once via initializer
         print(f"  Using {n_workers} parallel workers...")
-        worker_fn = partial(
-            process_single_tile,
-            predictions_dir=predictions_dir,
-            evaluator_path=config.EVALUATOR_SAVE_PATH,
-            model_path=config.MODEL_SSL_ONLY_SAVE_PATH
-        )
+        worker_fn = partial(process_single_tile, predictions_dir=predictions_dir)
 
-        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_init_worker,
+            initargs=(config.EVALUATOR_SAVE_PATH, config.MODEL_SSL_ONLY_SAVE_PATH)
+        ) as executor:
             futures = {executor.submit(worker_fn, tile): tile for tile in tiles_to_process}
 
             for i, future in enumerate(as_completed(futures)):
