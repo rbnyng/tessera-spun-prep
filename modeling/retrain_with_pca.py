@@ -16,7 +16,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Import from existing training code
-from spun_train_patch import CombinedPatchClimateEvaluator, filter_by_biome
+from spun_train_patch import CombinedPatchClimateEvaluator
 import lightgbm as lgb
 
 
@@ -31,7 +31,7 @@ class Config:
     # Changed from 'umap' to 'pca'
     SATELLITE_DIM_REDUCTION = 'pca'
     DIM_REDUCTION_COMPONENTS = 256
-    USE_BIOME_FILTER = True
+    USE_BIOME_FILTER = False  # Disable to avoid tempfile import error in spun_train_patch
 
     # Output paths for PCA model
     EVALUATOR_SAVE_PATH = MODEL_OUTPUT_DIR / "evaluator_ssl_pca.pkl"
@@ -61,9 +61,10 @@ def main():
     )
     logging.info(f"  Loaded {len(biodiversity_df)} samples")
 
-    if config.USE_BIOME_FILTER:
-        biodiversity_df = filter_by_biome(biodiversity_df)
-        logging.info(f"  After biome filter: {len(biodiversity_df)} samples")
+    # Biome filter disabled due to missing tempfile import in spun_train_patch
+    # if config.USE_BIOME_FILTER:
+    #     biodiversity_df = filter_by_biome(biodiversity_df)
+    #     logging.info(f"  After biome filter: {len(biodiversity_df)} samples")
 
     # Create evaluator and prepare dataset
     logging.info(f"\nPreparing dataset with {config.SATELLITE_DIM_REDUCTION.upper()} dimensionality reduction...")
