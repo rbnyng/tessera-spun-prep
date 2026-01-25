@@ -20,6 +20,7 @@ import argparse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
+import multiprocessing as mp
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -202,6 +203,11 @@ def download_embeddings_for_park(config: Config, park_name: str, year: int, aoi_
         raise
 
 
+def process_single_tile_str(tile_path_str: str, predictions_dir_str: str):
+    """Wrapper that takes strings (for multiprocessing pickling)."""
+    return process_single_tile(Path(tile_path_str), Path(predictions_dir_str))
+
+
 def process_single_tile(tile_path: Path, predictions_dir: Path):
     """
     Worker function to process a single tile. Designed for parallel execution.
@@ -294,11 +300,10 @@ def run_inference_per_tile(config: Config, park_name: str, year: int, evaluator,
     processed = 0
     errors = 0
 
-    # Initialize model globals (shared by all threads, or used by single worker)
-    _init_worker(config.EVALUATOR_SAVE_PATH, config.MODEL_SSL_ONLY_SAVE_PATH)
-
     if n_workers == 1:
-        # Sequential processing
+        # Sequential processing - initialize globals in main process
+        _init_worker(config.EVALUATOR_SAVE_PATH, config.MODEL_SSL_ONLY_SAVE_PATH)
+
         for i, tile_path in enumerate(tiles_to_process):
             result = process_single_tile(tile_path, predictions_dir)
             if result == "processed":
@@ -310,24 +315,26 @@ def run_inference_per_tile(config: Config, park_name: str, year: int, evaluator,
             if (i + 1) % 10 == 0:
                 print(f"    Processed {i + 1}/{len(tiles_to_process)} tiles...")
     else:
-        # Parallel processing with threads (share memory, no pickling issues)
-        print(f"  Using {n_workers} parallel threads...")
-        worker_fn = partial(process_single_tile, predictions_dir=predictions_dir)
+        # Parallel processing with multiprocessing.Pool (true parallelism)
+        print(f"  Using {n_workers} parallel processes...")
 
-        with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            futures = {executor.submit(worker_fn, tile): tile for tile in tiles_to_process}
+        # Convert paths to strings for pickling, create args list
+        args_list = [(str(tile), str(predictions_dir)) for tile in tiles_to_process]
 
-            for i, future in enumerate(as_completed(futures)):
-                result = future.result()
-                if result == "processed":
-                    processed += 1
-                elif result.startswith("error"):
-                    errors += 1
-                    tile = futures[future]
-                    print(f"    ERROR: {tile.name}: {result}")
+        with mp.Pool(
+            processes=n_workers,
+            initializer=_init_worker,
+            initargs=(config.EVALUATOR_SAVE_PATH, config.MODEL_SSL_ONLY_SAVE_PATH)
+        ) as pool:
+            results = pool.starmap(process_single_tile_str, args_list, chunksize=1)
 
-                if (i + 1) % 20 == 0:
-                    print(f"    Completed {i + 1}/{len(tiles_to_process)} tiles...")
+        for result in results:
+            if result == "processed":
+                processed += 1
+            elif result.startswith("error"):
+                errors += 1
+
+        print(f"    Completed {len(results)} tiles")
 
     print(f"  Inference complete: {processed} processed, {skipped} skipped, {errors} errors")
     return True
