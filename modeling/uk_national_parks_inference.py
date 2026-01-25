@@ -52,11 +52,12 @@ class Config:
     ]
     TRAINING_REPRESENTATIONS_DIR = "/maps-priv/maps/ray25/data/ecm_representations"
     MODEL_OUTPUT_DIR = Path("./model")
-    EVALUATOR_SAVE_PATH = MODEL_OUTPUT_DIR / "evaluator_ssl_only.pkl"
-    MODEL_SSL_ONLY_SAVE_PATH = MODEL_OUTPUT_DIR / "model_ssl_only.pkl"
-    SATELLITE_DIM_REDUCTION = 'umap'
+    # Use PCA model (much faster than UMAP: 0.5s vs 1236s per tile)
+    EVALUATOR_SAVE_PATH = MODEL_OUTPUT_DIR / "evaluator_ssl_pca.pkl"
+    MODEL_SSL_ONLY_SAVE_PATH = MODEL_OUTPUT_DIR / "model_ssl_pca.pkl"
+    SATELLITE_DIM_REDUCTION = 'pca'
     DIM_REDUCTION_COMPONENTS = 256
-    USE_BIOME_FILTER = True
+    USE_BIOME_FILTER = False
 
     # === UK National Parks Shapefiles ===
     NATIONAL_PARKS_DIR = Path("/maps-priv/maps/ray25/nationalparks")
