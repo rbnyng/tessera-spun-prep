@@ -8,7 +8,7 @@ Parks: Cairngorms, Lake District, Yorkshire Dales
 Years: 2017, 2024 (extensible to full 2017-2024 range)
 
 Usage:
-    python uk_national_parks_inference.py
+    python uk_national_parks_inference.py [--workers N]
 """
 
 import subprocess
@@ -16,7 +16,11 @@ import pickle
 import json
 import zipfile
 import tempfile
+import argparse
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
+import multiprocessing as mp
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -25,6 +29,19 @@ import rasterio
 from rasterio.transform import from_origin
 from skimage.util import view_as_windows
 import geopandas as gpd
+
+# Global variables for worker processes (initialized once per worker)
+_worker_evaluator = None
+_worker_model = None
+
+
+def _init_worker(evaluator_path: Path, model_path: Path):
+    """Initialize worker process by loading model once."""
+    global _worker_evaluator, _worker_model
+    with open(evaluator_path, 'rb') as f:
+        _worker_evaluator = pickle.load(f)
+    with open(model_path, 'rb') as f:
+        _worker_model = pickle.load(f)
 
 
 class Config:
@@ -35,11 +52,12 @@ class Config:
     ]
     TRAINING_REPRESENTATIONS_DIR = "/maps-priv/maps/ray25/data/ecm_representations"
     MODEL_OUTPUT_DIR = Path("./model")
-    EVALUATOR_SAVE_PATH = MODEL_OUTPUT_DIR / "evaluator_ssl_only.pkl"
-    MODEL_SSL_ONLY_SAVE_PATH = MODEL_OUTPUT_DIR / "model_ssl_only.pkl"
-    SATELLITE_DIM_REDUCTION = 'umap'
+    # Use PCA model (much faster than UMAP: 0.5s vs 1236s per tile)
+    EVALUATOR_SAVE_PATH = MODEL_OUTPUT_DIR / "evaluator_ssl_pca.pkl"
+    MODEL_SSL_ONLY_SAVE_PATH = MODEL_OUTPUT_DIR / "model_ssl_pca.pkl"
+    SATELLITE_DIM_REDUCTION = 'pca'
     DIM_REDUCTION_COMPONENTS = 256
-    USE_BIOME_FILTER = True
+    USE_BIOME_FILTER = False
 
     # === UK National Parks Shapefiles ===
     NATIONAL_PARKS_DIR = Path("/maps-priv/maps/ray25/nationalparks")
@@ -162,7 +180,9 @@ def download_embeddings_for_park(config: Config, park_name: str, year: int, aoi_
     embeddings_dir = config.get_embeddings_dir(park_name, year)
     embeddings_dir.mkdir(parents=True, exist_ok=True)
 
-    if any(embeddings_dir.glob('*.tif')):
+    # geotessera nests files: global_0.1_degree_representation/{year}/grid_*/grid_*_{year}.tiff
+    repr_dir = embeddings_dir / 'global_0.1_degree_representation' / str(year)
+    if repr_dir.exists() and any(repr_dir.glob('*/*.tiff')):
         print(f"  Embeddings for {park_name} {year} already exist. Skipping download.")
         return
 
@@ -184,25 +204,164 @@ def download_embeddings_for_park(config: Config, park_name: str, year: int, aoi_
         raise
 
 
-def create_mosaic(config: Config, park_name: str, year: int):
+def process_single_tile_str(tile_path_str: str, predictions_dir_str: str):
+    """Wrapper that takes strings (for multiprocessing pickling)."""
+    return process_single_tile(Path(tile_path_str), Path(predictions_dir_str))
+
+
+def process_single_tile(tile_path: Path, predictions_dir: Path):
     """
-    Merge downloaded embedding tiles into a single mosaic GeoTIFF.
+    Worker function to process a single tile. Designed for parallel execution.
+    Uses global _worker_evaluator and _worker_model (loaded once per worker via initializer).
+    """
+    global _worker_evaluator, _worker_model
+
+    pred_tile_path = predictions_dir / f"{tile_path.stem}_pred.tif"
+
+    # Skip if already exists
+    if pred_tile_path.exists():
+        return "skipped"
+
+    try:
+        with rasterio.open(tile_path) as src:
+            tile_data = src.read().transpose(1, 2, 0)  # (H, W, C)
+            profile = src.profile
+
+        h, w, c = tile_data.shape
+
+        # Create 3x3 windows for spatial context
+        padded = np.pad(tile_data, ((1, 1), (1, 1), (0, 0)), mode='constant', constant_values=np.nan)
+        windows = view_as_windows(padded, (3, 3, c), step=1)
+        feature_vectors = windows.reshape(h * w, -1)
+
+        # Filter valid pixels
+        valid_mask = ~np.isnan(feature_vectors).any(axis=1)
+        valid_features = feature_vectors[valid_mask]
+
+        if valid_features.shape[0] == 0:
+            return "empty"
+
+        # Apply model pipeline
+        scaled_pixels = _worker_evaluator.scaler.transform(valid_features)
+        reduced_pixels = _worker_evaluator.dim_reduction_model.transform(scaled_pixels)
+        predictions_flat = _worker_model.predict(reduced_pixels)
+
+        # Reconstruct prediction map
+        final_predictions = np.full(h * w, np.nan, dtype=np.float32)
+        final_predictions[valid_mask] = predictions_flat
+        prediction_map = final_predictions.reshape(h, w)
+
+        # Save prediction tile
+        profile.update(count=1, dtype='float32', nodata=np.nan, compress='LZW')
+        with rasterio.open(pred_tile_path, 'w', **profile) as dst:
+            dst.write(prediction_map, 1)
+
+        return "processed"
+
+    except Exception as e:
+        return f"error: {e}"
+
+
+def run_inference_per_tile(config: Config, park_name: str, year: int, evaluator, model, n_workers: int = 1):
+    """
+    Run SSL model inference on each embedding tile individually.
+    Saves per-tile predictions to a subdirectory.
+
+    Args:
+        n_workers: Number of parallel workers (1 = sequential)
     """
     embeddings_dir = config.get_embeddings_dir(park_name, year)
-    mosaic_path = config.get_mosaic_path(park_name, year)
+    predictions_dir = config.get_park_output_dir(park_name) / f"predictions_tiles_{year}"
+    predictions_dir.mkdir(parents=True, exist_ok=True)
 
-    if mosaic_path.exists():
-        print(f"  Mosaic for {park_name} {year} already exists. Skipping.")
-        return
+    # Find embedding tiles
+    repr_dir = embeddings_dir / 'global_0.1_degree_representation' / str(year)
+    embedding_files = list(repr_dir.glob('*/*.tiff')) + list(repr_dir.glob('*/*.tif'))
 
-    embedding_files = list(embeddings_dir.glob('*.tif'))
     if not embedding_files:
         print(f"  ERROR: No embedding tiles found for {park_name} {year}")
+        return False
+
+    # Filter to only tiles that need processing
+    tiles_to_process = []
+    skipped = 0
+    for tile_path in embedding_files:
+        pred_tile_path = predictions_dir / f"{tile_path.stem}_pred.tif"
+        if pred_tile_path.exists():
+            skipped += 1
+        else:
+            tiles_to_process.append(tile_path)
+
+    print(f"  Running inference on {len(embedding_files)} tiles ({skipped} already done, {len(tiles_to_process)} to process)...")
+
+    if not tiles_to_process:
+        print(f"  All tiles already processed!")
+        return True
+
+    processed = 0
+    errors = 0
+
+    if n_workers == 1:
+        # Sequential processing - initialize globals in main process
+        _init_worker(config.EVALUATOR_SAVE_PATH, config.MODEL_SSL_ONLY_SAVE_PATH)
+
+        for i, tile_path in enumerate(tiles_to_process):
+            result = process_single_tile(tile_path, predictions_dir)
+            if result == "processed":
+                processed += 1
+            elif result.startswith("error"):
+                errors += 1
+                print(f"    ERROR: {tile_path.name}: {result}")
+
+            if (i + 1) % 10 == 0:
+                print(f"    Processed {i + 1}/{len(tiles_to_process)} tiles...")
+    else:
+        # Parallel processing with multiprocessing.Pool (true parallelism)
+        print(f"  Using {n_workers} parallel processes...")
+
+        # Convert paths to strings for pickling, create args list
+        args_list = [(str(tile), str(predictions_dir)) for tile in tiles_to_process]
+
+        with mp.Pool(
+            processes=n_workers,
+            initializer=_init_worker,
+            initargs=(config.EVALUATOR_SAVE_PATH, config.MODEL_SSL_ONLY_SAVE_PATH)
+        ) as pool:
+            results = pool.starmap(process_single_tile_str, args_list, chunksize=1)
+
+        for result in results:
+            if result == "processed":
+                processed += 1
+            elif result.startswith("error"):
+                errors += 1
+
+        print(f"    Completed {len(results)} tiles")
+
+    print(f"  Inference complete: {processed} processed, {skipped} skipped, {errors} errors")
+    return True
+
+
+def merge_prediction_tiles(config: Config, park_name: str, year: int):
+    """
+    Merge per-tile predictions into a single prediction GeoTIFF.
+    Only merges single-band predictions (much lower memory than 128-band embeddings).
+    """
+    predictions_dir = config.get_park_output_dir(park_name) / f"predictions_tiles_{year}"
+    final_prediction_path = config.get_prediction_path(park_name, year)
+
+    if final_prediction_path.exists():
+        print(f"  Final prediction for {park_name} {year} already exists. Skipping merge.")
         return
 
-    print(f"  Creating mosaic from {len(embedding_files)} tiles...")
+    pred_tiles = list(predictions_dir.glob('*_pred.tif'))
+    if not pred_tiles:
+        print(f"  ERROR: No prediction tiles found to merge for {park_name} {year}")
+        return
 
-    src_files = [rasterio.open(fp) for fp in embedding_files]
+    print(f"  Merging {len(pred_tiles)} prediction tiles...")
+
+    # Open all prediction tiles
+    src_files = [rasterio.open(fp) for fp in pred_tiles]
     mosaic_data, out_transform = merge(src_files)
 
     out_meta = src_files[0].meta.copy()
@@ -211,77 +370,26 @@ def create_mosaic(config: Config, park_name: str, year: int):
         "height": mosaic_data.shape[1],
         "width": mosaic_data.shape[2],
         "transform": out_transform,
-        "compress": "LZW"
+        "compress": "LZW",
+        "BIGTIFF": "IF_SAFER"
     })
 
-    with rasterio.open(mosaic_path, "w", **out_meta) as dest:
+    with rasterio.open(final_prediction_path, "w", **out_meta) as dest:
         dest.write(mosaic_data)
 
     for src in src_files:
         src.close()
 
-    print(f"  Mosaic saved: {mosaic_path}")
-
-
-def run_inference(config: Config, park_name: str, year: int, evaluator, model):
-    """
-    Run SSL model inference on a mosaic to produce a prediction TIF.
-    """
-    mosaic_path = config.get_mosaic_path(park_name, year)
-    prediction_path = config.get_prediction_path(park_name, year)
-
-    if prediction_path.exists():
-        print(f"  Prediction for {park_name} {year} already exists. Skipping.")
-        return
-
-    if not mosaic_path.exists():
-        print(f"  ERROR: Mosaic not found for {park_name} {year}")
-        return
-
-    print(f"  Running inference for {park_name} {year}...")
-
-    with rasterio.open(mosaic_path) as src:
-        mosaic_np = src.read().transpose(1, 2, 0)  # (H, W, C)
-        profile = src.profile
-
-    h, w, c = mosaic_np.shape
-    print(f"    Mosaic shape: {h} x {w} pixels, {c} bands")
-
-    # Create 3x3 windows for spatial context
-    padded_mosaic = np.pad(mosaic_np, ((1, 1), (1, 1), (0, 0)), mode='constant', constant_values=np.nan)
-    windows = view_as_windows(padded_mosaic, (3, 3, c), step=1)
-    feature_vectors = windows.reshape(h * w, -1)
-
-    # Filter valid pixels
-    valid_mask = ~np.isnan(feature_vectors).any(axis=1)
-    valid_features = feature_vectors[valid_mask]
-
-    print(f"    Valid pixels: {valid_features.shape[0]:,} / {h * w:,}")
-
-    # Apply model pipeline
-    scaled_pixels = evaluator.scaler.transform(valid_features)
-    reduced_pixels = evaluator.dim_reduction_model.transform(scaled_pixels)
-    predictions_flat = model.predict(reduced_pixels)
-
-    # Reconstruct prediction map
-    final_predictions = np.full(h * w, np.nan, dtype=np.float32)
-    final_predictions[valid_mask] = predictions_flat
-    prediction_map = final_predictions.reshape(h, w)
-
-    # Save prediction TIF
-    profile.update(count=1, dtype='float32', nodata=np.nan)
-    with rasterio.open(prediction_path, 'w', **profile) as dst:
-        dst.write(prediction_map, 1)
-
-    print(f"  Prediction saved: {prediction_path}")
+    print(f"  Final prediction saved: {final_prediction_path}")
 
     # Print stats
-    valid_preds = prediction_map[~np.isnan(prediction_map)]
-    print(f"    Richness range: {valid_preds.min():.1f} - {valid_preds.max():.1f}")
-    print(f"    Richness mean: {valid_preds.mean():.1f}")
+    valid_preds = mosaic_data[~np.isnan(mosaic_data)]
+    if valid_preds.size > 0:
+        print(f"    Richness range: {valid_preds.min():.1f} - {valid_preds.max():.1f}")
+        print(f"    Richness mean: {valid_preds.mean():.1f}")
 
 
-def process_park(config: Config, park_name: str, evaluator, model):
+def process_park(config: Config, park_name: str, evaluator, model, n_workers: int = 1):
     """
     Full processing pipeline for a single national park.
     """
@@ -316,11 +424,16 @@ def process_park(config: Config, park_name: str, evaluator, model):
     for year in config.YEARS:
         print(f"\n--- Year {year} ---")
         download_embeddings_for_park(config, park_name, year, aoi_path)
-        create_mosaic(config, park_name, year)
-        run_inference(config, park_name, year, evaluator, model)
+        if run_inference_per_tile(config, park_name, year, evaluator, model, n_workers=n_workers):
+            merge_prediction_tiles(config, park_name, year)
 
 
 def main():
+    parser = argparse.ArgumentParser(description="UK National Parks Mycorrhizal Richness Prediction")
+    parser.add_argument('--workers', '-w', type=int, default=1,
+                        help='Number of parallel workers for inference (default: 1)')
+    args = parser.parse_args()
+
     print("="*60)
     print("UK National Parks - Mycorrhizal Richness Prediction")
     print("="*60)
@@ -331,7 +444,7 @@ def main():
     print("\nChecking for pre-trained model...")
     ensure_model_exists(config)
 
-    # Load model and evaluator once
+    # Load model and evaluator once (for main process, workers load their own)
     print("\nLoading model and evaluator...")
     with open(config.EVALUATOR_SAVE_PATH, 'rb') as f:
         evaluator = pickle.load(f)
@@ -343,10 +456,11 @@ def main():
     parks_to_process = list(config.PARK_SHAPEFILES.keys())
     print(f"\nParks to process: {parks_to_process}")
     print(f"Years: {config.YEARS}")
+    print(f"Workers: {args.workers}")
 
     for park_name in parks_to_process:
         try:
-            process_park(config, park_name, evaluator, model)
+            process_park(config, park_name, evaluator, model, n_workers=args.workers)
         except Exception as e:
             print(f"\nERROR processing {park_name}: {e}")
             continue
